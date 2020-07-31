@@ -8,3 +8,9 @@ _AnalysisOutput.txt
 _TraceOutput.json
 _TraceOutput.bin
 
+*.xlsx
+*.json
+result.data
+cmake-build-debug/
+cmake-build-release/
+.idea/

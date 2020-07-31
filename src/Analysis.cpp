@@ -12,10 +12,11 @@ struct IUnknown; // workaround for old Win SDK header failures when using /permi
 #include "external/flat_hash_map/bytell_hash_map.hpp"
 #include "external/inih/cpp/INIReader.h"
 #include <algorithm>
-#include <assert.h>
+#include <cassert>
 #include <string>
-#include <string.h>
+#include <cstring>
 #include <vector>
+#include "CompilationInfo.h"
 
 struct Config
 {
@@ -51,6 +52,7 @@ struct Analysis
     : events(events_)
     , buildNames(buildNames_)
     , out(out_)
+    , m_compilationInfo(out_, WholeProcessInfo(0, 0, 0))
     {
         functions.reserve(256);
         instantiations.reserve(256);
@@ -59,6 +61,7 @@ struct Analysis
         headerMap.reserve(256);
     }
 
+    CompilationInfo m_compilationInfo;
     const BuildEvents& events;
     BuildNames& buildNames;
 
@@ -108,7 +111,7 @@ struct Analysis
     void EmitCollapsedTemplateOpt();
     void EmitCollapsedInfo(
         const ska::bytell_hash_map<std::string_view, InstantiateEntry> &collapsed,
-        const char *header_string);
+        const char *header_string,bool isTemplate);
 
     // key is (name,objfile), value is milliseconds
     typedef std::pair<DetailIndex, DetailIndex> IndexPair;
@@ -283,10 +286,10 @@ std::string_view Analysis::GetCollapsedName(DetailIndex detail)
 
 void Analysis::EmitCollapsedInfo(
     const ska::bytell_hash_map<std::string_view, InstantiateEntry> &collapsed,
-    const char *header_string)
+    const char *header_string,bool isTemplate)
 {
-    std::vector<std::pair<std::string, InstantiateEntry>> sorted_collapsed;
-    sorted_collapsed.resize(std::min<size_t>(config.templateCount, collapsed.size()));
+    std::vector<std::pair<std::string_view, InstantiateEntry>> sorted_collapsed;
+    sorted_collapsed.resize(collapsed.size());
     auto cmp = [](const auto &lhs, const auto &rhs) {
         return std::tie(lhs.second.us, lhs.second.count, lhs.first) > std::tie(rhs.second.us, rhs.second.count, rhs.first);
     };
@@ -296,14 +299,26 @@ void Analysis::EmitCollapsedInfo(
         cmp);
 
     fprintf(out, "%s%s**** %s%s:\n", col::kBold, col::kMagenta, header_string, col::kReset);
+    int n = std::min<size_t>(config.templateCount, collapsed.size());
+    int i=0;
     for (const auto &elt : sorted_collapsed)
     {
-        std::string dname = elt.first;
-        if (dname.size() > config.maxName)
-            dname = dname.substr(0, config.maxName - 2) + "...";
+        auto dname = elt.first;
+//        if (dname.size() > config.maxName)
+//            dname = dname.substr(0, config.maxName - 2) + "...";
         int ms = int(elt.second.us / 1000);
         int avg = int(ms / elt.second.count);
-        fprintf(out, "%s%6i%s ms: %s (%i times, avg %i ms)\n", col::kBold, ms, col::kReset, dname.c_str(), elt.second.count, avg);
+        if (i<n)
+        {
+            fprintf(out, "%s%6i%s ms: %s (%i times, avg %i ms)\n", col::kBold, ms, col::kReset, dname.data(), elt.second.count, avg);
+        }
+        i++;
+        if (isTemplate)
+        {
+            m_compilationInfo.AddTemplateSetsInfo(TemplateSetInfo(dname, ms, avg, elt.second.count));
+        } else{
+            m_compilationInfo.AddFunctionSetInfo(FunctionSetInfo(dname,ms,avg,elt.second.count));
+        }
     }
     fprintf(out, "\n");
 }
@@ -337,7 +352,7 @@ void Analysis::EmitCollapsedTemplates()
             stats.count += inst.second.count;
         }
     }
-    EmitCollapsedInfo(collapsed, "Template sets that took longest to instantiate");
+    EmitCollapsedInfo(collapsed, "Template sets that took longest to instantiate",true);
 }
 
 void Analysis::EmitCollapsedTemplateOpt()
@@ -355,11 +370,12 @@ void Analysis::EmitCollapsedTemplateOpt()
         ++stats.count;
         stats.us += fn.second;
     }
-    EmitCollapsedInfo(collapsed, "Function sets that took longest to compile / optimize");
+    EmitCollapsedInfo(collapsed, "Function sets that took longest to compile / optimize", false);
 }
 
 void Analysis::EndAnalysis()
 {
+    WholeProcessInfo wholeProcessInfo(totalParseUs + totalCodegenUs,totalParseUs,totalCodegenUs);
     if (totalParseUs || totalCodegenUs)
     {
         fprintf(out, "%s%s**** Time summary%s:\n", col::kBold, col::kMagenta, col::kReset);
@@ -383,13 +399,21 @@ void Analysis::EndAnalysis()
             return a.file < b.file;
             });
         fprintf(out, "%s%s**** Files that took longest to parse (compiler frontend)%s:\n", col::kBold, col::kMagenta, col::kReset);
-        for (size_t i = 0, n = std::min<size_t>(config.fileParseCount, indices.size()); i != n; ++i)
+        int n = std::min<size_t>(config.fileParseCount, indices.size());
+        for (size_t i = 0; i <= std::max<size_t>(config.fileParseCount, indices.size()); ++i)
         {
             const auto& e = parseFiles[indices[i]];
-            fprintf(out, "%s%6i%s ms: %s\n", col::kBold, int(e.us/1000), col::kReset, GetBuildName(e.file).data());
+            auto fileName = GetBuildName(e.file);
+            int time_ms = int(e.us/1000);
+            if (i<n)
+            {
+                fprintf(out, "%s%6i%s ms: %s\n", col::kBold, int(e.us/1000), col::kReset,fileName.data() );
+            }
+            m_compilationInfo.AddParseFilesInfo(ParseFileInfo(fileName, time_ms));
         }
         fprintf(out, "\n");
     }
+
     if (!codegenFiles.empty())
     {
         std::vector<int> indices;
@@ -404,10 +428,17 @@ void Analysis::EndAnalysis()
             return a.file < b.file;
             });
         fprintf(out, "%s%s**** Files that took longest to codegen (compiler backend)%s:\n", col::kBold, col::kMagenta, col::kReset);
-        for (size_t i = 0, n = std::min<size_t>(config.fileCodegenCount, indices.size()); i != n; ++i)
+        int n = std::min<size_t>(config.fileCodegenCount, indices.size());
+        for (size_t i = 0; i <= std::max<size_t>(config.fileCodegenCount, indices.size()); ++i)
         {
             const auto& e = codegenFiles[indices[i]];
-            fprintf(out, "%s%6i%s ms: %s\n", col::kBold, int(e.us/1000), col::kReset, GetBuildName(e.file).data());
+            auto fileName = GetBuildName(e.file);
+            int time_ms = int(e.us/1000);
+            if (i<n)
+            {
+                fprintf(out, "%s%6i%s ms: %s\n", col::kBold, int(e.us/1000), col::kReset,fileName.data() );
+            }
+            m_compilationInfo.AddCodegenFilesInfo(CodegenFileInfo(fileName, time_ms));
         }
         fprintf(out, "\n");
     }
@@ -429,17 +460,21 @@ void Analysis::EndAnalysis()
                 std::tie(a.second.us, a.second.count, a.first) >
                 std::tie(b.second.us, b.second.count, b.first);
         };
-        std::partial_sort(instArray.begin(), instArray.begin()+n, instArray.end(), cmp);
+        std::sort(instArray.begin(),instArray.end(),cmp);
         fprintf(out, "%s%s**** Templates that took longest to instantiate%s:\n", col::kBold, col::kMagenta, col::kReset);
-        for (size_t i = 0; i != n; ++i)
+        for (size_t i = 0; i < instArray.size(); ++i)
         {
             const auto& e = instArray[i];
-            std::string dname = std::string(GetBuildName(e.first));
-            if (dname.size() > config.maxName)
-                dname = dname.substr(0, config.maxName-2) + "...";
+            auto dname = GetBuildName(e.first);
+//            if (dname.size() > config.maxName)
+//                dname = dname.substr(0, config.maxName-2) + "...";
             int ms = int(e.second.us / 1000);
             int avg = int(ms / std::max(e.second.count,1));
-            fprintf(out, "%s%6i%s ms: %s (%i times, avg %i ms)\n", col::kBold, ms, col::kReset, dname.c_str(), e.second.count, avg);
+            if (i<n)
+            {
+                fprintf(out, "%s%6i%s ms: %s (%i times, avg %i ms)\n", col::kBold, ms, col::kReset, dname.data(), e.second.count, avg);
+            }
+            m_compilationInfo.AddTemplatesInfo(TemplateInfo(dname, ms, avg, e.second.count));
         }
         fprintf(out, "\n");
 
@@ -466,30 +501,39 @@ void Analysis::EndAnalysis()
             return a.first < b.first;
             });
         fprintf(out, "%s%s**** Functions that took longest to compile%s:\n", col::kBold, col::kMagenta, col::kReset);
-        for (size_t i = 0, n = std::min<size_t>(config.functionCount, indices.size()); i != n; ++i)
+        size_t n = std::min<size_t>(config.functionCount, indices.size());
+        for (size_t i = 0; i < indices.size(); ++i)
         {
             const auto& e = functionsArray[indices[i]];
-            std::string dname = std::string(GetBuildName(e.first.first));
-            if (dname.size() > config.maxName)
-                dname = dname.substr(0, config.maxName-2) + "...";
+            auto dname = GetBuildName(e.first.first);
             int ms = int(e.second / 1000);
-            fprintf(out, "%s%6i%s ms: %s (%s)\n", col::kBold, ms, col::kReset, dname.c_str(), GetBuildName(e.first.second).data());
+            auto file_name = GetBuildName(e.first.second);
+            if (i<n){
+                fprintf(out, "%s%6i%s ms: %s (%s)\n", col::kBold, ms, col::kReset, dname.data(), file_name.data());
+            }
+            m_compilationInfo.AddFunctionInfo(FunctionInfo(dname,file_name,ms));
         }
         fprintf(out, "\n");
         EmitCollapsedTemplateOpt();
     }
 
+    m_compilationInfo.SetWholeProcessInfo(wholeProcessInfo);
     FindExpensiveHeaders();
-
+    int n = std::min<size_t>(config.headerCount, expensiveHeaders.size());
     if (!expensiveHeaders.empty())
     {
+        int i = 0;
         fprintf(out, "%s%s*** Expensive headers%s:\n", col::kBold, col::kMagenta, col::kReset);
         for (const auto& e : expensiveHeaders)
         {
             const auto& es = headerMap[e.first];
             int ms = int(e.second / 1000);
             int avg = ms / es.count;
-            fprintf(out, "%s%i%s ms: %s%s%s (included %i times, avg %i ms), included via:\n", col::kBold, ms, col::kReset, col::kBold, e.first.data(), col::kReset, es.count, avg);
+            if (i < n)
+            {
+                fprintf(out, "%s%i%s ms: %s%s%s (included %i times, avg %i ms), included via:\n", col::kBold, ms, col::kReset, col::kBold, e.first.data(), col::kReset, es.count, avg);
+            }
+
             int pathCount = 0;
 
             auto sortedIncludeChains = es.includePaths;
@@ -499,26 +543,48 @@ void Analysis::EndAnalysis()
                     return a.us > b.us;
                 return a.files < b.files;
             });
+            std::vector<std::vector<std::string_view> > included_chains;
+            std::vector<int> included_chains_time;
 
             for (const auto& chain : sortedIncludeChains)
             {
-                fprintf(out, "  ");
+                if (i<n && pathCount < config.headerChainCount)
+                {
+                    fprintf(out, "  ");
+                }
+                std::vector<std::string_view> cur_chain;
                 for (auto it = chain.files.rbegin(), itEnd = chain.files.rend(); it != itEnd; ++it)
                 {
-                    fprintf(out, "%s ", utils::GetFilename(GetBuildName(*it)).data());
+                    std::string_view name = utils::GetFilename(GetBuildName(*it));
+                    if (i<n && pathCount < config.headerChainCount)
+                    {
+                        fprintf(out, "%s ", name.data());
+                    }
+                    cur_chain.push_back(name);
                 }
-                fprintf(out, " (%i ms)\n", int(chain.us/1000));
+                if (i<n && pathCount < config.headerChainCount)
+                {
+                    fprintf(out, " (%i ms)\n", int(chain.us/1000));
+                }
                 ++pathCount;
-                if (pathCount > config.headerChainCount)
-                    break;
+                included_chains_time.push_back(int(chain.us/1000));
+                included_chains.push_back(cur_chain);
             }
-            if (pathCount > config.headerChainCount)
+            if (i<n && pathCount > config.headerChainCount)
             {
                 fprintf(out, "  ...\n");
             }
-            fprintf(out, "\n");
+            if (i<n && pathCount < config.headerChainCount)
+            {
+                fprintf(out, "\n");
+            }
+            i++;
+            m_compilationInfo.AddExpensiveHeaderInfo(ExpensiveHeaderInfo(e.first,es.count,avg,ms,included_chains,included_chains_time));
         }
+
     }
+
+    m_compilationInfo.GenerateJsonFile();
 }
 
 void Analysis::FindExpensiveHeaders()
@@ -536,8 +602,7 @@ void Analysis::FindExpensiveHeaders()
             return a.second > b.second;
         return a.first < b.first;
     });
-    if (expensiveHeaders.size() > config.headerCount)
-        expensiveHeaders.resize(config.headerCount);
+
 }
 
 void Analysis::ReadConfig()

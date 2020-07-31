@@ -19,7 +19,13 @@ set(SRC
     "src/external/llvm-Demangle/lib/MicrosoftDemangle.cpp"
     "src/external/llvm-Demangle/lib/MicrosoftDemangleNodes.cpp"
     "src/external/simdjson/simdjson.cpp"
-)
+    "src/CompilationInfo.cpp")
+
 add_executable(ClangBuildAnalyzer "${SRC}")
 target_compile_features(ClangBuildAnalyzer PRIVATE cxx_std_17)
-target_link_libraries(ClangBuildAnalyzer -lrt -lpthread)
+target_link_libraries(ClangBuildAnalyzer -lpthread )
+
+find_library(LIBRT rt)
+if(LIBRT)
+    target_link_libraries(target_name ${LIBRT})
+endif()
